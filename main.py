@@ -103,7 +103,7 @@ async def retrieve_lexicon(request: LexiconRequest):
                 results.append({
                     "concept": row['concept'],
                     "definition": row['definition'],
-                    "domain': row['domain'],
+                    "domain": row['domain'],
                     "source": row['source']
                 })
         except:
