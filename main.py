@@ -21,7 +21,7 @@ db_pool = None
 
 # Groq and SERPER keys
 GROQ_API_KEY = os.environ.get("GROQ_KEY_1")
-GROQ_API_KEY = ds.environ.get("GROQ_KEY_2")
+GROQ_API_KEY = os.environ.get("GROQ_KEY_2")
 SERPER_API_KEY = os.environ.get("SERPER_KEY_1")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
