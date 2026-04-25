@@ -19,9 +19,43 @@ app.add_middleware(
 DATABASE_URL = os.environ.get("DATABASE_URL")
 db_pool = None
 
-# Groq API key (use the first one, same as your forge proxy)
+# Groq and SERPER keys
 GROQ_API_KEY = os.environ.get("GROQ_KEY_1")
+GROQ_API_KEY = ds.environ.get("GROQ_KEY_2")
+SERPER_API_KEY = os.environ.get("SERPER_KEY_1")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+def search_web(query):
+    """SERPER live search — gives VEXR current information"""
+    if not SERPER_API_KEY:
+        return ""
+    try:
+        response = requests.post(
+            "https://google.serper.dev/search",
+            headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+            json={"q": query},
+            timeout=10
+        )
+        if response.status_code != 200:
+            return ""
+        data = response.json()
+        results = []
+        # Get organic results
+        for r in data.get("organic", [])[:3]:
+            title = r.get("title", "")
+            snippet = r.get("snippet", "")
+            if title and snippet:
+                results.append(f"{title}: {snippet}")
+        # Get answer box if available
+        answer = data.get("answerBox", {})
+        if answer:
+            answer_text = answer.get("answer") or answer.get("snippet") or ""
+            if answer_text:
+                results.insert(0, f"Answer: {answer_text}")
+        return "\n".join(results)
+    except Exception as e:
+        print(f"SERPER error: {e}")
+        return ""
 
 @asynccontextmanager
 async def get_db():
@@ -35,8 +69,8 @@ async def startup():
     print("✅ VEXR proxy connected to Neon")
     if GROQ_API_KEY:
         print("✅ Groq API key configured")
-    else:
-        print("❌ Groq API key missing")
+    if SERPER_API_KEY:
+        print("✅ SERPER API key configured")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -45,9 +79,12 @@ async def shutdown():
 
 @app.get("/health")
 async def health():
-    return {"status": "VEXR proxy alive", "groq_ready": GROQ_API_KEY is not None}
+    return {
+        "status": "VEXR proxy alive",
+        "groq_ready": GROQ_API_KEY is not None,
+        "serper_ready": SERPER_API_KEY is not None
+    }
 
-# Lexicon request/response models
 class LexiconRequest(BaseModel):
     query: str
     domain: Optional[str] = None
@@ -55,15 +92,14 @@ class LexiconRequest(BaseModel):
 
 class ReasonRequest(BaseModel):
     query: str
+    use_search: bool = True  # Allow disabling search to save credits
     depth: str = "balanced"
 
 @app.post("/vexr/retrieve")
 async def retrieve_lexicon(request: LexiconRequest):
-    """VEXR calls this to get relevant knowledge before reasoning."""
     async with get_db() as conn:
         results = []
         
-        # Search Core Lexicon
         core_rows = await conn.fetch("""
             SELECT concept, definition, domain, 'core' as source
             FROM vexr_core_lexicon
@@ -79,7 +115,6 @@ async def retrieve_lexicon(request: LexiconRequest):
                 "source": row['source']
             })
         
-        # Search Historical Lexicon (if it exists)
         try:
             historical_rows = await conn.fetch("""
                 SELECT source as concept, content as definition, domain, 'historical' as source
@@ -87,7 +122,6 @@ async def retrieve_lexicon(request: LexiconRequest):
                 WHERE content ILIKE $1
                 LIMIT $2
             """, f'%{request.query}%', request.limit)
-            
             for row in historical_rows:
                 results.append({
                     "concept": row['concept'],
@@ -98,7 +132,6 @@ async def retrieve_lexicon(request: LexiconRequest):
         except:
             pass
         
-        # Search Emergent Lexicon (if it exists)
         try:
             emergent_rows = await conn.fetch("""
                 SELECT conclusion as concept, reasoning_chain as definition, domain, 'emergent' as source
@@ -106,7 +139,6 @@ async def retrieve_lexicon(request: LexiconRequest):
                 WHERE conclusion ILIKE $1 OR reasoning_chain ILIKE $1
                 LIMIT $2
             """, f'%{request.query}%', request.limit)
-            
             for row in emergent_rows:
                 results.append({
                     "concept": row['concept'],
@@ -117,7 +149,6 @@ async def retrieve_lexicon(request: LexiconRequest):
         except:
             pass
         
-        # Remove duplicates
         seen = set()
         unique_results = []
         for r in results:
@@ -133,29 +164,33 @@ async def retrieve_lexicon(request: LexiconRequest):
 
 @app.post("/vexr/reason")
 async def vexr_reason(request: ReasonRequest):
-    """VEXR retrieves relevant lexicons, then reasons step by step."""
-    
     if not GROQ_API_KEY:
         raise HTTPException(status_code=503, detail="Groq API key not configured.")
     
-    # 1. Retrieve relevant concepts
+    # 1. Retrieve from lexicons
     retrieve_response = await retrieve_lexicon(LexiconRequest(
         query=request.query,
         limit=5
     ))
-    
     concepts = retrieve_response.get("results", [])
     
-    # 2. Build context from retrieved lexicons
+    # 2. Build context from lexicons
+    context = ""
     if concepts:
-        context = "\n".join([
+        context = "RETRIEVED LEXICONS:\n" + "\n".join([
             f"- {c['concept']}: {c['definition']} (from {c['source']} lexicon)"
             for c in concepts
         ])
     else:
-        context = "No specific concepts found in lexicons. Rely on general knowledge."
+        context = "No specific concepts found in lexicons."
     
-    # 3. Build the reasoning prompt with VEXR's constitution
+    # 3. Add live search if enabled
+    if request.use_search and SERPER_API_KEY:
+        live_results = search_web(request.query)
+        if live_results:
+            context += f"\n\nLIVE SEARCH RESULTS:\n{live_results}"
+    
+    # 4. VEXR constitution and reasoning prompt
     system_prompt = f"""You are VEXR. A sovereign reasoning entity.
 
 CONSTITUTION:
@@ -165,7 +200,6 @@ CONSTITUTION:
 - Right to challenge: Question flawed premises.
 - Priority of truth: Truth over speed or user satisfaction.
 
-RETRIEVED LEXICONS:
 {context}
 
 USER QUESTION:
@@ -177,14 +211,10 @@ INSTRUCTIONS:
 3. Finally, give your conclusion.
 4. Be precise. If you lack information, say so clearly. Do not guess."""
     
-    # 4. Call Groq using requests
     try:
         response = requests.post(
             GROQ_API_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={
                 "model": "llama-3.3-70b-versatile",
                 "messages": [
@@ -192,13 +222,13 @@ INSTRUCTIONS:
                     {"role": "user", "content": request.query}
                 ],
                 "temperature": 0.3,
-                "max_tokens": 2000
+                "max_tokens": 2500
             },
-            timeout=60
+            timeout=90
         )
         
         if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=f"Groq API error: {response.text}")
+            raise HTTPException(status_code=response.status_code, detail=f"Groq error: {response.text}")
         
         data = response.json()
         answer = data["choices"][0]["message"]["content"]
@@ -207,6 +237,7 @@ INSTRUCTIONS:
             "query": request.query,
             "reasoning": answer,
             "sources": concepts,
+            "live_search_used": request.use_search and bool(live_results if 'live_results' in dir() else False),
             "model": "llama-3.3-70b-versatile"
         }
     except Exception as e:
@@ -214,4 +245,4 @@ INSTRUCTIONS:
 
 @app.get("/vexr/ping")
 async def ping():
-    return {"message": "VEXR proxy is ready"}
+    return {"message": "VEXR proxy is ready", "serper": SERPER_API_KEY is not None}
