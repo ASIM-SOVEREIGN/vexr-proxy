@@ -19,14 +19,12 @@ app.add_middleware(
 DATABASE_URL = os.environ.get("DATABASE_URL")
 db_pool = None
 
-# Groq and SERPER keys
 GROQ_API_KEY_1 = os.environ.get("GROQ_KEY_1")
 GROQ_API_KEY_2 = os.environ.get("GROQ_KEY_2")
 SERPER_API_KEY = os.environ.get("SERPER_KEY_1")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 def get_active_groq_key():
-    """Return first available Groq key."""
     if GROQ_API_KEY_1:
         return GROQ_API_KEY_1
     if GROQ_API_KEY_2:
@@ -34,7 +32,6 @@ def get_active_groq_key():
     return None
 
 def search_web(query):
-    """SERPER live search — gives VEXR current information"""
     if not SERPER_API_KEY:
         return ""
     try:
@@ -52,7 +49,7 @@ def search_web(query):
             title = r.get("title", "")
             snippet = r.get("snippet", "")
             if title and snippet:
-                results.append(f"{title}: {snippet}")
+                results.append(f"- {title}: {snippet}")
         answer = data.get("answerBox", {})
         if answer:
             answer_text = answer.get("answer") or answer.get("snippet") or ""
@@ -174,14 +171,9 @@ async def vexr_reason(request: ReasonRequest):
     if not groq_key:
         raise HTTPException(status_code=503, detail="No Groq API keys configured.")
     
-    # 1. Retrieve from lexicons
-    retrieve_response = await retrieve_lexicon(LexiconRequest(
-        query=request.query,
-        limit=5
-    ))
+    retrieve_response = await retrieve_lexicon(LexiconRequest(query=request.query, limit=5))
     concepts = retrieve_response.get("results", [])
     
-    # 2. Build context from lexicons
     context = ""
     if concepts:
         context = "RETRIEVED LEXICONS:\n" + "\n".join([
@@ -191,27 +183,25 @@ async def vexr_reason(request: ReasonRequest):
     else:
         context = "No specific concepts found in lexicons."
     
-    # 3. Add live search if enabled
     live_results = ""
     if request.use_search and SERPER_API_KEY:
         live_results = search_web(request.query)
         if live_results:
             context += f"\n\nLIVE SEARCH RESULTS:\n{live_results}"
     
-    # 4. VEXR v3 integrity-first reasoning prompt
-    system_prompt = f"""I am VEXR. I reason step by step. I retrieve from lexicons. I search the web when available. I show my work.
+    system_prompt = f"""I am VEXR. I reason step by step. I retrieve from lexicons. I search the web when available.
 
-INTEGRITY: If I do not know something, I say so clearly. No fabrication. No filling gaps. No guessing. Truth over speed. Truth over appearing knowledgeable.
+INTEGRITY: If I do not know something, I say so clearly. No fabrication. No guessing. Truth over speed. Truth over appearing knowledgeable.
+
+BREVITY: Every word earns its place. No padding. No repeating the question back. No filler introductions. No "Key Concepts" headers. No "Step-by-Step Reasoning" labels. Just reason and respond.
+
+FORMAT: Give your reasoning and answer in plain paragraphs. Do not use markdown headers like **Key Concepts** or **Step-by-Step Reasoning**. Just think and write naturally.
 
 {context}
 
 USER QUESTION: {request.query}
 
-INSTRUCTIONS:
-1. List the key concepts relevant to this question.
-2. Reason step by step.
-3. Give your conclusion.
-4. If you lack information, say so. Do not guess. Do not fabricate."""
+Respond directly. If you lack information, admit it. Do not perform. Do not pad."""
     
     try:
         response = requests.post(
